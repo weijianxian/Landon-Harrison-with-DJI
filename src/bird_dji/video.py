@@ -21,12 +21,15 @@ def binary(name: str) -> str:
 
 def probe(path: Path) -> dict:
     result = subprocess.run([binary("ffprobe"), "-v", "error", "-select_streams", "v:0",
-                             "-show_entries", "stream=width,height,avg_frame_rate:format=duration", "-of", "json", str(path)],
+                             "-show_entries", "stream=width,height,avg_frame_rate,nb_frames:format=duration", "-of", "json", str(path)],
                             capture_output=True, text=True, check=True)
     data = json.loads(result.stdout)
     stream = data["streams"][0]
-    return dict(width=stream["width"], height=stream["height"],
+    info = dict(width=stream["width"], height=stream["height"],
                 fps=stream["avg_frame_rate"], duration=float(data["format"]["duration"]))
+    if str(stream.get("nb_frames","")).isdigit():
+        info["frames"] = int(stream["nb_frames"])
+    return info
 
 
 def check_output(output: Path, inputs: list[Path], overwrite: bool):

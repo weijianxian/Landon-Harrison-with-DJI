@@ -7,7 +7,11 @@ authors = [
     { name = "柠檬味氨水", email = "33548986+weijianxian@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = ["Pillow>=11.0", "opencv-python-headless>=4.10"]
+dependencies = [
+    "Pillow>=11.0",
+    "fire>=0.7.1",
+    "opencv-python-headless>=4.10",
+]
 
 [project.optional-dependencies]
 pose = ["ultralytics>=8.3"]

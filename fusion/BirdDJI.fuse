@@ -1,0 +1,675 @@
+-- Bird DJI HUD: native Fuse controls, no UIManager, external Resolve API or AI nodes.
+-- Cache is JSON data only. Never evaluate a cache as Lua code.
+FuRegisterClass("BirdDJI", CT_Tool, {
+    REGS_Name = "Bird DJI HUD", REGS_Category = "Fuses\\Bird DJI",
+    REGS_OpIconString = "DJI", REGS_Company = "bird-dji",
+    REGS_OpDescription = "Editable drone HUD from bird-dji analysis JSON",
+    REG_Version = 1, REG_NoMotionBlurCtrls = true, REG_NoObjMatCtrls = true,
+})
+
+BirdDJI = {}
+local B = BirdDJI
+local NULL = {}
+local function clamp(v,a,b) return math.max(a,math.min(b,v)) end
+local function number(v,default)
+    if type(v)=="number" and v==v and math.abs(v)<math.huge then return v end
+    return default
+end
+local function utf8char(n)
+    if n<128 then return string.char(n) end
+    if n<2048 then return string.char(192+math.floor(n/64),128+n%64) end
+    if n<65536 then return string.char(224+math.floor(n/4096),128+math.floor(n/64)%64,128+n%64) end
+    return string.char(240+math.floor(n/262144),128+math.floor(n/4096)%64,128+math.floor(n/64)%64,128+n%64)
+end
+function B.decode(text)
+    local pos,depth = 1,0
+    local parse
+    local function space() local _,e=text:find("^[ \t\r\n]*",pos); pos=(e or pos-1)+1 end
+    local function fail() error("Invalid JSON at byte "..pos) end
+    local function str()
+        if text:sub(pos,pos)~='"' then fail() end
+        pos=pos+1; local result={}
+        while pos<=#text do
+            local c=text:sub(pos,pos); pos=pos+1
+            if c=='"' then return table.concat(result) end
+            if c=='\\' then
+                local e=text:sub(pos,pos); pos=pos+1
+                local escapes={['"']='"',['\\']='\\',['/']='/',b='\b',f='\f',n='\n',r='\r',t='\t'}
+                if e=='u' then
+                    local hex=text:sub(pos,pos+3)
+                    if not hex:match('^%x%x%x%x$') then fail() end
+                    local n=tonumber(hex,16); pos=pos+4
+                    if n>=55296 and n<=56319 then
+                        if text:sub(pos,pos+1)~='\\u' then fail() end
+                        local low=tonumber(text:sub(pos+2,pos+5),16)
+                        if not low or low<56320 or low>57343 then fail() end
+                        n=65536+(n-55296)*1024+low-56320; pos=pos+6
+                    elseif n>=56320 and n<=57343 then fail() end
+                    result[#result+1]=utf8char(n)
+                elseif escapes[e] then result[#result+1]=escapes[e] else fail() end
+            elseif c:byte()<32 then fail()
+            else result[#result+1]=c end
+        end
+        fail()
+    end
+    parse=function()
+        space(); depth=depth+1; if depth>32 then fail() end
+        local c=text:sub(pos,pos); local v
+        if c=='"' then v=str()
+        elseif c=='[' or c=='{' then
+            pos=pos+1; v={}; space()
+            local closing=c=='[' and ']' or '}'
+            if text:sub(pos,pos)~=closing then
+                while true do
+                    local key
+                    if c=='{' then key=str(); space(); if text:sub(pos,pos)~=':' then fail() end; pos=pos+1 end
+                    local value=parse()
+                    if key then v[key]=value else v[#v+1]=value end
+                    space(); local sep=text:sub(pos,pos)
+                    if sep==closing then break end
+                    if sep~=',' then fail() end
+                    pos=pos+1; space()
+                end
+            end
+            pos=pos+1
+        elseif text:sub(pos,pos+3)=='null' then pos=pos+4; v=NULL
+        elseif text:sub(pos,pos+3)=='true' then pos=pos+4; v=true
+        elseif text:sub(pos,pos+4)=='false' then pos=pos+5; v=false
+        else
+            local token=text:sub(pos):match('^[^,%]}%s]+')
+            if not token then fail() end
+            local mantissa,exponent=token:match('^(.-)[eE](.*)$')
+            mantissa=mantissa or token
+            if exponent and not exponent:match('^[+-]?%d+$') then fail() end
+            if not (mantissa:match('^%-?%d+$') or mantissa:match('^%-?%d+%.%d+$')) or
+                mantissa:match('^%-?0%d') then fail() end
+            v=tonumber(token); if not number(v) then fail() end
+            pos=pos+#token
+        end
+        depth=depth-1; return v
+    end
+    local result=parse(); space(); if pos<=#text then fail() end
+    return result
+end
+function B.fps(value)
+    if type(value)=='string' then
+        local a,b=value:match('^(%d+)/(%d+)$')
+        if a and tonumber(b)>0 then return tonumber(a)/tonumber(b) end
+        return tonumber(value)
+    end
+    return number(value)
+end
+function B.validate(c)
+    assert(type(c)=='table' and c.schema=='bird-dji.fusion.v1','Unsupported cache schema')
+    assert(c.coordinates=='normalized-top-left','Unsupported cache coordinates')
+    assert(number(c.width,0)>0 and number(c.height,0)>0,'Invalid dimensions')
+    assert(number(B.fps(c.fps),0)>0 and number(c.duration,0)>0,'Invalid timing')
+    assert(type(c.frames)=='table' and #c.frames>0 and #c.frames==c.frame_count,'Invalid frame count')
+    assert(type(c.scans)=='table','Missing scans')
+    for i,f in ipairs(c.frames) do
+        assert(type(f)=='table' and number(f.time,-1)>=0 and
+               math.abs(f.time-(i-1)/B.fps(c.fps))<.00001,'Invalid frame time')
+        assert(type(f.look)=='table' and number(f.look[1]) and number(f.look[2]),'Invalid look')
+        assert(number(f.pose_scan,-1)>=0 and f.pose_scan%1==0 and f.pose_scan<=#c.scans,'Invalid scan index')
+    end
+    for _,s in ipairs(c.scans) do
+        assert(type(s.points)=='table' and type(s.boxes)=='table','Invalid scan')
+        for _,point in ipairs(s.points) do
+            assert(type(point)=='table' and number(point[1],-1)>=0 and point[1]<=1 and
+                   number(point[2],-1)>=0 and point[2]<=1 and
+                   number(point[3],-1)>=0 and point[3]<=1,'Invalid keypoint')
+        end
+        for _,box in ipairs(s.boxes) do
+            assert(type(box)=='table' and number(box.track) and number(box.x1,-1)>=0 and
+                   number(box.x2,2)<=1 and box.x1<=box.x2 and number(box.y1,-1)>=0 and
+                   number(box.y2,2)<=1 and box.y1<=box.y2,'Invalid person box')
+        end
+    end
+    return c
+end
+
+-- The control list is also the pure renderer's defaults; numeric controls are keyframeable.
+local controls={}
+local function control(page,id,label,default,lo,hi,kind,items)
+    controls[#controls+1]={page=page,id=id,label=label,default=default,lo=lo,hi=hi,kind=kind or 'number',items=items}
+end
+local function n(page,id,label,d,lo,hi) control(page,id,label,d,lo,hi) end
+local function toggle(page,id,label,d) control(page,id,label,d,0,1,'toggle') end
+local function txt(page,id,label,d) control(page,id,label,d,nil,nil,'text') end
+local function color(page,id,label,r,g,b,group)
+    for i,part in ipairs({'R','G','B'}) do
+        control(page,id..part,label..' '..part,({r,g,b})[i],0,1,'color',{group,i-1,label})
+    end
+end
+toggle('Analysis','AnalyzePose','分析人物关键点',1)
+n('Analysis','DetectionRate','分析频率（次/秒）',.5,1/60,120)
+control('Analysis','AnalysisQuality','检测精度',1,0,2,'combo',{'快速','均衡','精细'})
+
+txt('Data','CacheFile','分析缓存 JSON','')
+toggle('Data','UseCompStart','以合成起始帧为原点',1)
+n('Data','StartFrame','手动起始帧',0,-100000,100000)
+n('Data','TimelineFPS','时间线帧率（0 自动）',0,0,240)
+n('Data','SourceOffset','素材偏移（秒）',0,-3600,3600)
+n('Data','PlaybackSpeed','素材时间倍率',1,.01,20)
+n('Data','ManualDuration','无缓存时片长（秒）',10,.01,36000)
+n('Data','ManualSpeed','无缓存时速度',0,0,100)
+n('Data','ManualAltitude','无缓存时高度',2,-1000,10000)
+n('Data','ManualHeading','手动朝向（度）',0,-36000,36000)
+control('Data','HeadingMode','方向来源',0,0,2,'combo',{'视觉相对方向','GPS 航迹方向','手动方向'})
+n('Data','MaxSpeed','满速（0 使用整段峰值）',0,0,200)
+n('Data','AltitudeRange','高度尺满量程（米）',100,.1,10000)
+toggle('Layout','Transparent','合并输出只保留透明 UI',0)
+n('Layout','CenterX','HUD 中心 X',.5,-1,2)
+n('Layout','CenterY','HUD 中心 Y（上至下）',.5,-1,2)
+n('Layout','HUDScale','HUD 布局大小',.65,.1,2)
+n('Layout','Opacity','HUD 透明度',.85,0,1)
+n('Layout','LineWidth','线宽（1080p 像素）',4,.1,30)
+n('Layout','TextSize','文字大小（1080p 像素）',17,5,80)
+n('Layout','SmallTextSize','单位文字大小',13,5,80)
+txt('Layout','Font','字体','Microsoft YaHei')
+txt('Layout','FontStyle','字体样式','Regular')
+color('Layout','HUDColor','HUD 颜色',240/255,248/255,245/255,10)
+toggle('Brackets','ShowBrackets','显示两侧括号',1)
+n('Brackets','ArcWidth','括号水平半径 / HUD 宽',.33,.05,.6)
+n('Brackets','ArcHeight','括号垂直半径 / HUD 高',.6,.05,1.5)
+n('Brackets','ArcAngle','括号弧角（度）',30,2,85)
+n('Brackets','ArcGap','中心开口角（度）',1,.1,10)
+toggle('Brackets','ShowMarkers','显示水平短线',1)
+n('Brackets','MarkerInner','短线内距 / HUD 宽',.18,0,.6)
+n('Brackets','MarkerOuter','短线外距 / HUD 宽',.225,0,.6)
+toggle('Brackets','ShowCorners','显示四角小方块',1)
+n('Brackets','CornerSize','角落方块边长',8,1,40)
+toggle('Reticle','ShowReticle','显示瞄准圆圈',1)
+toggle('Reticle','ShowTether','连接到正中心',1)
+toggle('Reticle','AutoLook','使用镜头运动',1)
+n('Reticle','LookGain','镜头运动幅度倍率',1,0,10)
+n('Reticle','LookX','手动镜头 X',0,-1,1)
+n('Reticle','LookY','手动镜头 Y（上至下）',0,-1,1)
+n('Reticle','RangeX','横向最大偏移 / HUD 宽',.18,0,.5)
+n('Reticle','RangeY','纵向最大偏移 / HUD 高',.18,0,.5)
+n('Reticle','RingRadius','圆圈半径',18,1,100)
+n('Reticle','TetherWidth','连接线宽',2,.1,20)
+toggle('Compass','ShowCompass','显示方向刻度',1)
+n('Compass','CompassY','方向条位置 / HUD 高',.1,-.5,1.5)
+n('Compass','CompassWidth','方向条宽度 / HUD 宽',.35,.05,1)
+n('Compass','CompassSpan','方向条角度范围',120,10,360)
+n('Compass','TickStep','小刻度间隔（度）',5,1,45)
+n('Compass','MajorStep','大刻度间隔（度）',30,1,180)
+n('Compass','HeadingOffset','方向零点偏移（度）',0,-36000,36000)
+toggle('Gauges','ShowSpeed','显示速度尺',1)
+toggle('Gauges','ShowAltitude','显示高度尺',1)
+n('Gauges','SpeedX','速度尺 X / HUD 宽',.085,-.5,1.5)
+n('Gauges','AltitudeX','高度尺 X / HUD 宽',.915,-.5,1.5)
+n('Gauges','GaugeTop','标尺顶部 / HUD 高',.31,-.5,1.5)
+n('Gauges','GaugeBottom','标尺底部 / HUD 高',.74,-.5,1.5)
+txt('Gauges','SpeedLabel','速度标题','SPD')
+txt('Gauges','AltitudeLabel','高度标题','ALT')
+toggle('Life','ShowLife','显示生命条',1)
+n('Life','LifeX','生命条中心 X / HUD 宽',.5,-.5,1.5)
+n('Life','LifeY','生命条 Y / HUD 高',.9,-.5,1.5)
+n('Life','LifeWidth','生命条宽度 / HUD 宽',.3,.01,1)
+n('Life','LifeThickness','生命条厚度',7,.1,40)
+n('Life','EmptyRailOpacity','空轨道透明度比例',.22,0,1)
+n('Life','LifeStart','开始耗血时间（秒）',0,0,36000)
+n('Life','LifeEnd','耗尽时间（-1 素材末帧）',-1,-1,36000)
+toggle('People','ShowKeypoints','显示人物关键点',1)
+n('People','ResultInterval','方块更新间隔（秒，0 使用全部）',1,0,3600)
+n('People','PointSize','方块边长',10,2,60)
+n('People','PointStroke','方块线宽',1.5,.1,10)
+n('People','PointConfidence','显示置信度阈值',.5,0,1)
+n('People','PointOpacity','关键点透明度',.92,0,1)
+color('People','PointColor','关键点颜色',1,92/255,45/255,11)
+toggle('Prompt','ShowPrompt','显示蜂鸟提示',1)
+control('Prompt','TargetMode','人物选择方式',0,0,1,'combo',{'离瞄准圈最近的人','瞄准圈进入人物框'})
+n('Prompt','PromptSpeed','提示最大跟随速度（像素/秒）',180,0,4000)
+n('Prompt','PromptResponse','提示跟随响应（秒）',.2,.01,5)
+n('Prompt','PromptOffsetX','提示偏移 X（像素）',0,-1000,1000)
+n('Prompt','PromptOffsetY','提示偏移 Y（像素）',0,-1000,1000)
+n('Prompt','PromptTextSize','提示文字大小',17,5,80)
+n('Prompt','PromptBackground','提示底板透明度',.43,0,1)
+txt('Prompt','PromptKey','按键字样','X')
+txt('Prompt','PromptLabel','提示文字','释放蜂鸟')
+toggle('Alarm','EnableAlarm','启用自毁模式',1)
+n('Alarm','AlarmLast','默认末尾秒数',3,.01,36000)
+n('Alarm','AlarmAt','自毁开始时间（-1 按末尾秒数）',-1,-1,36000)
+n('Alarm','AlarmTransition','变红过渡时长（秒）',.12,.01,10)
+n('Alarm','AlarmLineFactor','自毁线宽比例',.4,.01,1)
+n('Alarm','AlarmOpacityFactor','自毁透明度比例',.45,0,1)
+n('Alarm','AlarmStrongGain','速度/横线/生命条亮度倍率',2.1,0,5)
+n('Alarm','AlarmRingFade','自毁圆圈额外淡化比例',.588,0,1)
+color('Alarm','AlarmColor','自毁颜色',228/255,30/255,34/255,12)
+toggle('Alarm','ShowBadge','显示自毁警告牌',1)
+n('Alarm','BadgeY','警告牌 Y / HUD 高',.79,-.5,1.5)
+n('Alarm','BadgeWidth','警告牌宽度',140,60,600)
+n('Alarm','BadgeHeight','警告牌高度',28,10,100)
+txt('Alarm','BadgeLabel','警告文字','自毁模式')
+B.controls=controls
+function B.defaults()
+    local p={}; for _,c in ipairs(controls) do p[c.id]=c.default end; return p
+end
+
+local function frameAt(c,t,p)
+    if not c or t<0 or t>=c.duration then return nil,nil end
+    local index=math.min(#c.frames,math.floor(t*B.fps(c.fps)+.000001)+1)
+    local f=c.frames[index]
+    local sample=f
+    if p and p.ResultInterval>0 then
+        local sampledTime=math.floor(t/p.ResultInterval+.000001)*p.ResultInterval
+        sample=c.frames[math.min(#c.frames,math.floor(sampledTime*B.fps(c.fps)+.000001)+1)]
+    end
+    return f,c.scans[sample.pose_scan]
+end
+local function aimAt(f,p)
+    local lx,ly=p.LookX,p.LookY
+    if p.AutoLook>.5 and f then lx,ly=f.look[1]*p.LookGain,f.look[2]*p.LookGain end
+    return p.CenterX+clamp(lx,-1,1)*p.HUDScale*p.RangeX,
+           p.CenterY+clamp(ly,-1,1)*p.HUDScale*p.RangeY
+end
+function B.follow(c,p)
+    local result={}; local x,y,track,last
+    local w,h=c.width,c.height
+    local scale=math.min(w/1920,h/1080)
+    for i,f in ipairs(c.frames) do
+        local _,scan=frameAt(c,f.time,p); local ax,ay=aimAt(f,p)
+        local target,best=nil,math.huge
+        for _,b in ipairs(scan and scan.boxes or {}) do
+            local bx,by=(b.x1+b.x2)/2,(b.y1+b.y2)/2
+            local eligible=p.TargetMode<.5 or (ax>=b.x1 and ax<=b.x2 and ay>=b.y1 and ay<=b.y2)
+            local distance=((bx-ax)*w)^2+((by-ay)*h)^2
+            if eligible and distance<best then target,best=b,distance end
+        end
+        if target then
+            local tx,ty=(target.x1+target.x2)*w/2,(target.y1+target.y2)*h/2
+            if target.track~=track or not x then x,y,track=tx,ty,target.track
+            else
+                local dt=math.max(0,f.time-last)
+                local dx,dy=tx-x,ty-y; local d=math.sqrt(dx*dx+dy*dy)
+                if d>0 then
+                    local step=math.min(d*(1-math.exp(-dt/p.PromptResponse)),p.PromptSpeed*scale*dt)
+                    x,y=x+dx/d*step,y+dy/d*step
+                end
+            end
+            result[i]={x/w,y/h,track}
+        else x,y,track=nil,nil,nil; result[i]=false end
+        last=f.time
+    end
+    return result
+end
+function B.scene(c,t,p,w,h,follow)
+    local scene={}; local f,scan=frameAt(c,t,p)
+    if c and not f then return scene end
+    local layer=math.floor(clamp(number(p.LayerMode,0),0,2)+.5)
+    local hud,people=layer~=2,layer~=1
+    local scale=math.min(w/1920,h/1080)
+    local lw,lh=w*p.HUDScale,h*p.HUDScale
+    local cx,cy=w*p.CenterX,h*p.CenterY
+    local ox,oy=cx-lw/2,cy-lh/2
+    local duration=c and c.duration or p.ManualDuration
+    local alarmStart=p.AlarmAt>=0 and p.AlarmAt or math.max(0,duration-p.AlarmLast)
+    local a=p.EnableAlarm>.5 and clamp((t-alarmStart)/p.AlarmTransition,0,1) or 0
+    a=a*a*(3-2*a)
+    local opacity=p.Opacity*(1-a+a*p.AlarmOpacityFactor)
+    local color={p.HUDColorR*(1-a)+p.AlarmColorR*a,p.HUDColorG*(1-a)+p.AlarmColorG*a,
+                 p.HUDColorB*(1-a)+p.AlarmColorB*a,opacity}
+    local stroke=p.LineWidth*scale*(1-a+a*p.AlarmLineFactor)
+    local function tint(base,factor)
+        return {base[1],base[2],base[3],clamp(base[4]*factor,0,1)}
+    end
+    local dim=tint(color,150/255); local strong=tint(color,1-a+a*p.AlarmStrongGain)
+    local ring=tint(color,1-a+a*p.AlarmRingFade)
+    local function path(points,ink,width,closed,tag)
+        scene[#scene+1]={kind='path',points=points,color=ink or color,width=width or stroke,closed=closed,tag=tag}
+    end
+    local function rect(x1,y1,x2,y2,ink,filled,width,tag)
+        scene[#scene+1]={kind=filled and 'fill' or 'path',points={{x1,y1},{x2,y1},{x2,y2},{x1,y2}},
+                        closed=true,color=ink or color,width=width or stroke,tag=tag}
+    end
+    local function line(x1,y1,x2,y2,ink,width,tag) path({{x1,y1},{x2,y2}},ink,width,false,tag) end
+    local function text(x,y,label,size,ink,tag)
+        scene[#scene+1]={kind='text',x=x,y=y,text=label,size=(size or p.TextSize)*scale,color=ink or color,tag=tag}
+    end
+    local function triangle(x,y,size,side,ink)
+        scene[#scene+1]={kind='fill',points={{x,y},{x+side*size,y-size*.6},{x+side*size,y+size*.6}},closed=true,color=ink or color}
+    end
+    if hud and p.ShowBrackets>.5 then
+        for _,side in ipairs({-1,1}) do
+            for _,range in ipairs({{-p.ArcAngle,-math.min(p.ArcGap,p.ArcAngle)},{math.min(p.ArcGap,p.ArcAngle),p.ArcAngle}}) do
+                local points={}
+                for i=0,32 do
+                    local angle=(range[1]+(range[2]-range[1])*i/32)*math.pi/180
+                    points[#points+1]={cx+side*lw*p.ArcWidth*math.cos(angle),cy+lh*p.ArcHeight*math.sin(angle)}
+                end
+                path(points); local endp=range[1]<0 and points[1] or points[#points]
+                line(endp[1],endp[2],endp[1]-side*7*scale,endp[2])
+            end
+            for _,dy in ipairs({-5,5}) do
+                line(cx+side*lw*p.ArcWidth,cy+dy*scale,cx+side*(lw*p.ArcWidth-8*scale),cy+dy*scale)
+            end
+        end
+    end
+    if hud and p.ShowMarkers>.5 then
+        for _,side in ipairs({-1,1}) do
+            line(cx+side*lw*.155,cy,cx+side*lw*.165,cy,strong)
+            line(cx+side*lw*p.MarkerInner,cy,cx+side*lw*p.MarkerOuter,cy,strong)
+        end
+    end
+    if hud and p.ShowCorners>.5 then
+        for _,x in ipairs({.15,.85}) do for _,y in ipairs({.11,.95}) do
+            local px,py,r=ox+x*lw,oy+y*lh,p.CornerSize*scale/2
+            rect(px-r,py-r,px+r,py+r,dim,false)
+        end end
+    end
+    local ax,ay=aimAt(f,p); ax,ay=ax*w,ay*h
+    if hud and p.ShowReticle>.5 then
+        local r=p.RingRadius*scale; local dx,dy=ax-cx,ay-cy; local distance=math.sqrt(dx*dx+dy*dy)
+        if p.ShowTether>.5 and distance>r+stroke then
+            line(cx,cy,ax-dx/distance*r,ay-dy/distance*r,ring,p.TetherWidth*scale*(1-a+a*p.AlarmLineFactor),'tether')
+        end
+        local circle={}
+        for i=0,64 do local angle=i/64*math.pi*2; circle[#circle+1]={ax+r*math.cos(angle),ay+r*math.sin(angle)} end
+        path(circle,ring,stroke,true,'reticle')
+    end
+    if hud and p.ShowCompass>.5 then
+        local heading=p.ManualHeading
+        if f and p.HeadingMode<.5 then heading=f.visual_heading
+        elseif f and p.HeadingMode<1.5 then heading=number(f.heading) end
+        local degrees=(heading or 0)+p.HeadingOffset
+        local step=math.max(1,math.floor(p.TickStep+.5)); local major=math.max(step,math.floor(p.MajorStep/step+.5)*step)
+        local span=p.CompassSpan; local y=oy+lh*p.CompassY
+        for tick=math.ceil((degrees-span/2)/step)*step,math.floor((degrees+span/2)/step)*step,step do
+            local x=cx+(tick-degrees)/span*lw*p.CompassWidth
+            local big=tick%major==0
+            line(x,y,x,y+(big and 8 or 4)*scale,heading and color or dim)
+            if big and heading then
+                local value=p.HeadingMode<.5 and (tick+180)%360-180 or tick%360
+                local label=p.HeadingMode<.5 and (value==0 and '0°' or string.format('%+d°',value)) or string.format('%03d°',value)
+                text(x,y-16*scale,label)
+            end
+        end
+        scene[#scene+1]={kind='fill',points={{cx,y+25*scale},{cx-4*scale,y+17*scale},{cx+4*scale,y+17*scale}},closed=true,color=color}
+        if not heading then text(cx,y-17*scale,'--') end
+    end
+    local top,bottom=oy+lh*p.GaugeTop,oy+lh*p.GaugeBottom
+    local function gauge(isSpeed)
+        local x=ox+lw*(isSpeed and p.SpeedX or p.AltitudeX)
+        local value=f and number(isSpeed and f.speed or f.altitude) or (not c and (isSpeed and p.ManualSpeed or p.ManualAltitude))
+        if value==false then value=nil end
+        local maxSpeed=p.MaxSpeed>0 and p.MaxSpeed or (c and c.max_speed or 10)
+        local range=isSpeed and math.max(.000001,number(maxSpeed,0)) or p.AltitudeRange
+        local y=bottom-clamp((value or 0)/range,0,1)*(bottom-top)
+        text(x,top-40*scale,isSpeed and p.SpeedLabel or p.AltitudeLabel)
+        if isSpeed then
+            line(x,top,x,bottom,dim)
+            if value then line(x,bottom,x,y,strong) end
+        else for i=0,24 do local py=top+(bottom-top)*i/24; line(x-3*scale,py,x+3*scale,py,dim) end end
+        line(x-5*scale,top,x+5*scale,top); line(x-5*scale,bottom,x+5*scale,bottom)
+        local bx=x+(isSpeed and -47 or 48)*scale
+        rect(bx-34*scale,y-12*scale,bx+34*scale,y+12*scale,dim,false)
+        text(bx,y,value and string.format(isSpeed and '%.1f' or '%.0f',value) or '--')
+        text(bx,y+23*scale,isSpeed and 'M/S' or 'M',p.SmallTextSize)
+        if value then triangle(x+(isSpeed and 8 or -9)*scale,y,9*scale,isSpeed and 1 or -1,isSpeed and strong or color) end
+    end
+    if hud and p.ShowSpeed>.5 then gauge(true) end
+    if hud and p.ShowAltitude>.5 then gauge(false) end
+    if hud and p.ShowLife>.5 then
+        local last=c and (#c.frames-1)/B.fps(c.fps) or duration
+        local finish=p.LifeEnd>=0 and p.LifeEnd or last
+        local health=finish>p.LifeStart and 1-clamp((t-p.LifeStart)/(finish-p.LifeStart),0,1) or (t<p.LifeStart and 1 or 0)
+        local x,y=ox+lw*p.LifeX,oy+lh*p.LifeY; local half=lw*p.LifeWidth/2
+        line(x-half,y,x+half,y,tint(color,p.EmptyRailOpacity),p.LifeThickness*scale,'life-rail')
+        if health>0 then line(x-half*health,y,x+half*health,y,strong,p.LifeThickness*scale,'life-fill') end
+    end
+    if people and p.ShowKeypoints>.5 and scan then
+        local ink={p.PointColorR,p.PointColorG,p.PointColorB,p.PointOpacity}
+        for _,point in ipairs(scan.points) do
+            if point[3]>=p.PointConfidence then
+                local x,y,r=point[1]*w,point[2]*h,p.PointSize*scale/2
+                rect(x-r,y-r,x+r,y+r,{.11,.02,.01,.39},true)
+                rect(x-r,y-r,x+r,y+r,ink,false,p.PointStroke*scale,'keypoint')
+                local dot=1.5*scale
+                path({{x,y-dot},{x+dot,y},{x,y+dot},{x-dot,y}},ink,p.PointStroke*scale,true)
+            end
+        end
+    end
+    if people and p.ShowPrompt>.5 and c then
+        local index=math.min(#c.frames,math.floor(t*B.fps(c.fps)+.000001)+1)
+        local positions=follow or B.follow(c,p); local position=positions[index]
+        if position then
+            -- Approximate label extent only for backing and screen-edge clamp; glyphs use the real font.
+            local _,glyphs=p.PromptLabel:gsub('[\128-\191]','')
+            local count=#p.PromptLabel-glyphs
+            local total=(34+count*p.PromptTextSize*.8)*scale
+            local x=clamp(position[1]*w+p.PromptOffsetX*scale,total/2+4*scale,w-total/2-4*scale)
+            local y=clamp(position[2]*h+p.PromptOffsetY*scale,20*scale,h-20*scale)
+            rect(x-total/2-4*scale,y-17*scale,x+total/2+4*scale,y+17*scale,{.047,.059,.063,p.PromptBackground},true,nil,'prompt')
+            rect(x-total/2,y-13*scale,x-total/2+25*scale,y+13*scale,{.88,.90,.89,.9},true)
+            text(x-total/2+12.5*scale,y,p.PromptKey,p.PromptTextSize,{.086,.098,.098,1})
+            text(x+17*scale,y,p.PromptLabel,p.PromptTextSize,{.93,.95,.93,.9})
+        end
+    end
+    if hud and a>0 and p.ShowBadge>.5 then
+        local y=oy+lh*p.BadgeY; local half=p.BadgeWidth*scale/2; local hh=p.BadgeHeight*scale/2
+        local ink={p.AlarmColorR,p.AlarmColorG,p.AlarmColorB,.86*a}
+        rect(cx-half,y-hh,cx+half,y+hh,ink,true,nil,'alarm-badge')
+        local tx=cx-half+16*scale
+        scene[#scene+1]={kind='fill',points={{tx,y-10*scale},{tx-10*scale,y+9*scale},{tx+10*scale,y+9*scale}},closed=true,color={.06,.008,.008,a}}
+        text(tx,y+2*scale,'!',13,{1,.3,.28,a})
+        text(cx+10*scale,y,p.BadgeLabel,p.TextSize,{1,.84,.84,.92*a})
+    end
+    return scene
+end
+
+local cache,cacheKey,cacheError,followCache,followKey
+local function backendFolder(comp)
+    local folder=comp and comp:MapPath('Fuses:BirdDJI') or ''
+    local file=io.open(folder..'/install.json','rb')
+    if file then file:close(); return folder end
+    return (os.getenv('APPDATA') or '')..'/Blackmagic Design/DaVinci Resolve/Support/Fusion/Fuses/BirdDJI'
+end
+function Create()
+    InImage=self:AddInput('Background','Background',{LINKID_DataType='Image',LINK_Main=1,INP_Required=false})
+    local folder=backendFolder(self.Comp)
+    local page
+    local groups={Analysis='素材分析',Data='数据与时间',Layout='图层与布局',
+        Brackets='括号与标线',Reticle='瞄准圈',Compass='方向条',Gauges='速度与高度',
+        Life='生命条',People='人物关键点',Prompt='蜂鸟提示',Alarm='自毁模式'}
+    for _,c in ipairs(controls) do
+        if page~=c.page then
+            if page then self:EndControlNest() end
+            page=c.page
+            self:BeginControlNest(groups[page],page..'Group',page=='Analysis' or page=='Layout')
+        end
+        local attrs={LINKID_DataType='Number',INPID_InputControl='SliderControl',
+                     INP_Default=c.default,INP_MinAllowed=c.lo,INP_MaxAllowed=c.hi,
+                     INP_MinScale=c.lo,INP_MaxScale=c.hi}
+        if c.kind=='text' then
+            local fileControl=c.id=='CacheFile' or c.id=='VideoFile' or c.id=='SrtFile' or c.id=='AnalysisModel'
+            attrs={LINKID_DataType='Text',INPID_InputControl=fileControl and 'FileControl' or 'TextEditControl',
+                   INPS_DefaultText=c.default,TEC_Lines=1}
+            if fileControl then attrs.FC_ClipBrowse=false end
+            if c.id=='Font' or c.id=='FontStyle' then
+                attrs.INPID_InputControl='FontFileControl'; attrs.IC_ControlGroup=13
+                attrs.IC_ControlID=c.id=='Font' and 0 or 1
+            end
+        elseif c.kind=='toggle' then attrs.INPID_InputControl='CheckboxControl'; attrs.INP_Integer=true
+        elseif c.kind=='combo' then
+            attrs.INPID_InputControl='ComboControl'; attrs.INP_Integer=true
+            for _,label in ipairs(c.items) do attrs[#attrs+1]={CCS_AddString=label} end
+        elseif c.kind=='color' then
+            attrs.INPID_InputControl='ColorControl'; attrs.IC_ControlGroup=c.items[1]
+            attrs.IC_ControlID=c.items[2]; attrs.ICS_Name=c.items[3]
+        end
+        if c.page=='Analysis' then attrs.INP_External=false; attrs.INP_Passive=true end
+        if c.id=='CacheFile' then attrs.INP_External=false end
+        -- Fusion copies named global input handles into each render Lua state.
+        -- Handles stored only in a local table disappear outside Create().
+        getfenv(1)['InHUD'..c.id]=self:AddInput(c.label,c.id,attrs)
+        if c.id=='AnalysisQuality' then
+            InGenerate=self:AddInput('分析当前素材并自动加载','GenerateCache',{LINKID_DataType='Number',
+                INPID_InputControl='ButtonControl',INP_Default=0,INP_DoNotifyChanged=true,INP_InitialNotify=false,INP_Passive=true})
+            InStatus=self:AddInput('分析状态','AnalysisStatus',{LINKID_DataType='Text',INPID_InputControl='TextEditControl',
+                INPS_DefaultText='就绪',INP_External=false,INP_Passive=true,TEC_ReadOnly=true,TEC_Lines=2})
+            InToken=self:AddInput('Analysis token','AnalysisToken',{LINKID_DataType='Text',INPS_DefaultText='',
+                INP_External=false,IC_Visible=false,INP_Passive=true})
+            InRevision=self:AddInput('Cache revision','CacheRevision',{LINKID_DataType='Number',INP_Default=0,
+                INP_External=false,IC_Visible=false})
+        end
+        if c.id=='CacheFile' then
+            InReload=self:AddInput('重新读取缓存','ReloadCache',{LINKID_DataType='Number',
+                INPID_InputControl='ButtonControl',INP_Default=0,INP_DoNotifyChanged=true,INP_InitialNotify=false})
+            InDiskCache=self:AddInput('预渲染 / 管理画面缓存','DiskCache',{LINKID_DataType='Number',
+                INPID_InputControl='ButtonControl',INP_Default=0,INP_DoNotifyChanged=true,INP_InitialNotify=false,INP_Passive=true})
+        end
+    end
+    self:EndControlNest()
+    -- With three outputs, Resolve places the middle registered socket on the right.
+    OutHUD=self:AddOutput('固定 HUD','OutputHUD',{LINKID_DataType='Image',LINK_Main=2})
+    OutImage=self:AddOutput('合并画面','Output',{LINKID_DataType='Image',LINK_Main=1})
+    OutPeople=self:AddOutput('人物追踪','OutputPeople',{LINKID_DataType='Image',LINK_Main=3})
+end
+function NotifyChanged(inp,param,time)
+    if (inp~=InGenerate and inp~=InReload and inp~=InDiskCache) or not param or number(param.Value,0)<.5 then return end
+    if inp==InReload then cacheKey=nil end
+    if inp==InGenerate or inp==InDiskCache then
+        local ok,err=pcall(function()
+            local function value(id) return getfenv(Create)['InHUD'..id]:GetSource(time or 0).Value end
+            local token=tostring(os.time())..'-'..tostring(math.floor(os.clock()*1000000))..'-'..tostring(math.random(100000,999999))
+            InToken:SetSource(Text(token),0)
+            local folder=backendFolder(self.Comp)
+            if inp==InDiskCache then
+                self.Comp:Execute('local m=assert(loadfile('..string.format('%q',folder..'/analysis-button.lua')..'))(); '..
+                    'm.disk(comp,'..string.format('%q',token)..')')
+                return
+            end
+            local img=InImage:GetSource(time or 0)
+            local video=img and img.Metadata and img.Metadata.Filename or ''
+            assert(video~='','请将插件连接到视频片段的 MediaIn 后再分析')
+            local job={video=video,bundle_dir=folder,cache_dir=folder..'/cache',
+                pose_enabled=value('AnalyzePose')>.5,detection_rate=value('DetectionRate'),
+                image_size=({640,960,1280})[math.floor(value('AnalysisQuality'))+1],device='auto'}
+            local entries={}
+            for k,v in pairs(job) do entries[#entries+1]=k..'='..(type(v)=='string' and string.format('%q',v) or tostring(v)) end
+            local code='local m=assert(loadfile('..string.format('%q',folder..'/analysis-button.lua')..'))(); '..
+                'm.run(comp,'..string.format('%q',token)..',{'..table.concat(entries,',')..'},'..string.format('%q',folder)..')'
+            self.Comp:Execute(code)
+        end)
+        if not ok then InStatus:SetSource(Text('分析失败：'..tostring(err)),0); print('Bird DJI: '..tostring(err)) end
+    end
+end
+local function readCache(path,revision)
+    local key=path..':'..tostring(revision)
+    if key~=cacheKey then
+        cacheKey=key; cache=nil; cacheError=nil; followCache=nil; followKey=nil
+        if path~='' then
+            local ok,value=pcall(function()
+                local mapped=self.Comp:MapPath(path)
+                local file=assert(io.open(mapped,'rb'),'Cannot open analysis JSON')
+                local size=file:seek('end'); file:seek('set',0)
+                if not size or size>64*1024*1024 then file:close(); error('Cache exceeds 64 MB') end
+                local raw=file:read('*a'); file:close()
+                raw=raw:gsub('^\239\187\191','')
+                return B.validate(B.decode(raw))
+            end)
+            if ok then cache=value else cacheError=tostring(value); print('Bird DJI: '..cacheError) end
+        end
+    end
+    return cache
+end
+local function codepoints(text)
+    local chars={}; local i=1
+    while i<=#text do
+        local a=text:byte(i); local n,len=a,1
+        if a>=240 then n,len=a-240,4 elseif a>=224 then n,len=a-224,3 elseif a>=192 then n,len=a-192,2 end
+        for j=1,len-1 do n=n*64+((text:byte(i+j) or 128)-128) end
+        chars[#chars+1]=n; i=i+len
+    end
+    return chars
+end
+local function drawText(out,item,p,w,h)
+    if item.text=='' then return end
+    if not next(FontManager:GetFontList()) then FontManager:ScanDir() end
+    local tfm=TextStyleFontMetrics(TextStyleFont(p.Font,p.FontStyle))
+    -- The SDK metrics are in tenths of normalized font units. Size the
+    -- ascender in pixels, using the same factor for glyphs and advances.
+    local size=item.size/(w*10*tfm.TextAscent); local glyphs=codepoints(item.text); local width=0
+    for _,ch in ipairs(glyphs) do width=width+tfm:CharacterWidth(ch)*10*size end
+    local shape=Shape(); local cursor=(item.x/w)-width/2
+    local sy=out.YScale/out.XScale
+    for _,ch in ipairs(glyphs) do
+        local advance=tfm:CharacterWidth(ch)*10*size
+        local mat=Matrix4(); mat:Scale(size/tfm.Scale,size/tfm.Scale,1)
+        mat:Move(cursor+advance/2,(h-item.y-item.size*.35)/w*sy,0)
+        shape:AddShape(tfm:GetCharacterShape(ch,false):TransformOfShape(mat))
+        cursor=cursor+advance
+    end
+    local channel=ImageChannel(out,8); channel:SetStyleFill(FillStyle())
+    channel:ShapeFill(shape)
+    local alpha=item.color[4]
+    local style=ChannelStyle(); style.Color=Pixel{R=item.color[1]*alpha,G=item.color[2]*alpha,B=item.color[3]*alpha,A=alpha}
+    channel:PutToImage('CM_Merge',style)
+end
+local function paint(out,scene,p,w,h)
+    local sy=out.YScale/out.XScale
+    for _,item in ipairs(scene) do
+        if item.color[4]>0 then
+            if item.kind=='text' then drawText(out,item,p,w,h)
+            else
+                local shape=Shape()
+                for i,pt in ipairs(item.points) do
+                    if i==1 then shape:MoveTo(pt[1]/w,(h-pt[2])/w*sy)
+                    else shape:LineTo(pt[1]/w,(h-pt[2])/w*sy) end
+                end
+                if item.closed then shape:Close() end
+                if item.kind=='path' then shape=shape:OutlineOfShape(item.width/w,'OLT_Solid','OJT_Round',8,'SWM_Normal',8) end
+                local channel=ImageChannel(out,8); channel:SetStyleFill(FillStyle()); channel:ShapeFill(shape)
+                local alpha=item.color[4]
+                local style=ChannelStyle(); style.Color=Pixel{R=item.color[1]*alpha,G=item.color[2]*alpha,B=item.color[3]*alpha,A=alpha}
+                channel:PutToImage('CM_Merge',style)
+            end
+        end
+    end
+end
+function Process(req)
+    local p={}
+    for _,c in ipairs(controls) do
+        local input=assert(getfenv(1)['InHUD'..c.id],'Missing HUD input: '..c.id)
+        local value=assert(input:GetValue(req),'Missing HUD value: '..c.id)
+        p[c.id]=value.Value
+    end
+    local c=readCache(p.CacheFile,InRevision:GetValue(req).Value)
+    local source=InImage:GetValue(req)
+    local out
+    local precalc=req:IsPreCalc()
+    if source then
+        out=precalc and Image{IMG_Like=source,IMG_NoData=true} or source:CopyOf()
+        if not precalc and p.Transparent>.5 then out:Clear() end
+    else
+        out=Image{IMG_Document=self.Comp,IMG_Width=c and c.width or 1920,
+                  IMG_Height=c and c.height or 1080,IMG_Depth=8,IMG_Quality=not req:IsQuick(),IMG_NoData=precalc}
+        if not precalc then out:Clear() end
+    end
+    if precalc then
+        OutImage:Set(req,out); OutHUD:Set(req,out); OutPeople:Set(req,out); return
+    end
+    local start=p.UseCompStart>.5 and number(self.Comp.GlobalStart,number(self.Comp.RenderStart,0)) or p.StartFrame
+    local fps=p.TimelineFPS>0 and p.TimelineFPS or number(self.Comp:GetPrefs('Comp.FrameFormat.Rate'),c and B.fps(c.fps) or 30)
+    if fps<=0 then fps=30 end
+    local t=(req.Time-start)/fps*p.PlaybackSpeed+p.SourceOffset
+    local w,h=out.Width,out.Height
+    local key=table.concat({p.CenterX,p.CenterY,p.HUDScale,p.AutoLook,p.LookGain,p.LookX,p.LookY,
+                          p.RangeX,p.RangeY,p.TargetMode,p.PromptSpeed,p.PromptResponse,p.ResultInterval},':')
+    if c and p.ShowPrompt>.5 and followKey~=key then followCache=B.follow(c,p); followKey=key end
+    local hud=Image{IMG_Like=out}; hud:Clear()
+    local people=Image{IMG_Like=out}; people:Clear()
+    p.LayerMode=1; local hudScene=B.scene(c,t,p,w,h,followCache)
+    p.LayerMode=2; local peopleScene=B.scene(c,t,p,w,h,followCache)
+    if cacheError then
+        hudScene={{kind='text',x=w/2,y=h/2,text='CACHE ERROR - see Fusion Console',size=24*math.min(w/1920,h/1080),color={1,.1,.1,1}}}
+        peopleScene={}
+    end
+    paint(hud,hudScene,p,w,h); paint(people,peopleScene,p,w,h)
+    -- Layer outputs are always premultiplied RGBA, independently of the main output.
+    local merge={} -- Native defaults: additive (premultiplied) alpha over.
+    out:Merge(people,merge); out:Merge(hud,merge)
+    OutImage:Set(req,out); OutHUD:Set(req,hud); OutPeople:Set(req,people)
+end

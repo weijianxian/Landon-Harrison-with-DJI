@@ -1,68 +1,51 @@
-import argparse
+"""Python Fire command line interface for the HUD and Fusion analyzer."""
 from fractions import Fraction
+from inspect import Parameter, signature
 import math
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
+
+import fire
+
 from .hud import HUD,render_hud,self_destruct_progress
 from .telemetry import Telemetry
-from .video import check_output, mask, overlay, probe
+from .video import check_output, mask as render_mask, overlay, probe
 
 
-def main():
-    parser = argparse.ArgumentParser(description="DJI SRT → 游戏无人机 HUD 透明 mask → FFmpeg 合成")
-    sub = parser.add_subparsers(dest="command", required=True)
-    for name, description in [("mask", "生成透明 MOV、绿幕视频或 PNG 序列"), ("render", "生成 mask 并合成视频"),
-                              ("preview", "导出单帧透明 PNG"), ("batch", "批量配对同名视频和 SRT")]:
-        p = sub.add_parser(name, help=description)
-        if name == "batch":
-            p.add_argument("directory", type=Path)
-            p.add_argument("--output-dir", type=Path, default=Path("outputs"))
-        else:
-            p.add_argument("--srt", type=Path, required=True)
-            p.add_argument("--video", type=Path, required=name == "render", help="自动匹配视频尺寸、帧率和时长")
-            p.add_argument("-o", "--output", type=Path, required=True)
-        p.add_argument("--width", type=int)
-        p.add_argument("--height", type=int)
-        p.add_argument("--fps", help="例如 30000/1001；默认匹配视频，否则 30")
-        p.add_argument("--duration", type=float, help="只处理前 N 秒")
-        p.add_argument("--self-destruct-last", type=float, default=3, help="末尾多少秒进入自毁模式，默认 3")
-        p.add_argument("--self-destruct-at", type=float, help="指定开始自毁的时间点（秒），优先于末尾秒数")
-        p.add_argument("--no-self-destruct", action="store_true", help="关闭自毁模式")
-        p.add_argument("--opacity", type=float, default=.85)
-        p.add_argument("--line-width", type=float, default=4, help="1920×1080 基准线宽，随分辨率缩放")
-        p.add_argument("--hud-scale", type=float, default=.65, help="HUD 占原布局的比例，整体居中")
-        p.add_argument("--reticle", choices=["auto","fixed"], default="auto", help="有视频时通过画面运动估计圆圈方向")
-        p.add_argument("--reticle-gain", type=float, default=12, help="转镜头响应强度，默认 12")
-        p.add_argument("--reticle-range", type=float, default=.18, help="圆圈最大偏移占 HUD 宽/高的比例，默认 0.18")
-        p.add_argument("--pose", action="store_true", help="YOLOv8 人体关键点橙黄色方块")
-        p.add_argument("--pose-model", type=Path, default=Path("models/yolov8n-pose.pt"))
-        p.add_argument("--pose-interval", type=float, default=2, help="检测间隔秒，默认 2 秒（0.5 次/秒）")
-        p.add_argument("--pose-imgsz", type=int, default=960, help="检测输入尺寸，默认 960")
-        p.add_argument("--pose-confidence", type=float, default=.5, help="关键点置信度阈值")
-        p.add_argument("--pose-device", default="cpu", help="cpu 或 CUDA 设备编号，如 0")
-        p.add_argument("--no-release-prompt", action="store_true", help="关闭最近人物的释放蜂鸟提示")
-        p.add_argument("--release-follow-speed", type=float, default=180, help="提示跟随的速度上限，1080p 像素/秒")
-        p.add_argument("--window", type=float, default=1, help="GPS 估算窗口（秒）")
-        p.add_argument("--offset", type=float, default=0, help="视频 t 秒使用 SRT t+offset 秒")
-        p.add_argument("--overwrite", action="store_true")
-        if name == "preview":
-            p.add_argument("--time", type=float, default=0)
-        if name == "mask":
-            p.add_argument("--mask-format", choices=["transparent","green","png"], default="transparent",
-                           help="默认透明 MOV；green 为绿幕 MOV/MP4；png 为透明 PNG 序列，output 指定目录")
-        if name in ("render", "batch"):
-            p.add_argument("--encoder", choices=["libx264", "h264_nvenc"], default="libx264")
-            p.add_argument("--crf", type=int, default=18)
-    p = sub.add_parser("overlay", help="使用已有透明 mask 合成视频")
-    p.add_argument("--video", type=Path, required=True)
-    p.add_argument("--mask", type=Path, required=True)
-    p.add_argument("-o", "--output", type=Path, required=True)
-    p.add_argument("--duration", type=float)
-    p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--encoder", choices=["libx264", "h264_nvenc"], default="libx264")
-    p.add_argument("--crf", type=int, default=18)
-    args = parser.parse_args()
+def _run(command, srt=None, video=None, output=None, directory=None,
+         output_dir="outputs", width=None, height=None, fps=None, duration=None,
+         self_destruct_last=3, self_destruct_at=None, no_self_destruct=False,
+         opacity=.85, line_width=4, hud_scale=.65, reticle="auto",
+         reticle_gain=12, reticle_range=.18, pose=False,
+         pose_model="models/yolov8n-pose.pt", pose_interval=2, pose_imgsz=960,
+         pose_confidence=.5, pose_device="cpu", no_release_prompt=False,
+         release_follow_speed=180, window=1, offset=0, overwrite=False,
+         time=0, mask_format="transparent", encoder="libx264", crf=18,
+         mask=None):
+    args = SimpleNamespace(**locals())
     try:
+        required = ("directory",) if command == "batch" else ("srt", "output")
+        if command == "overlay":
+            required = ("video", "mask", "output")
+        elif command in ("render", "analyze"):
+            required += ("video",)
+        for name in required:
+            if getattr(args, name) is None:
+                raise ValueError(f"需要指定 --{name.replace('_', '-')}")
+        for name in ("srt", "video", "output", "directory", "output_dir", "pose_model", "mask"):
+            value = getattr(args, name)
+            if value is not None:
+                setattr(args, name, Path(str(value)))
+        # Fire parses literal values, while FFmpeg and YOLO expect text here.
+        args.fps = str(args.fps) if args.fps is not None else None
+        args.pose_device = str(args.pose_device)
+        for name, choices in (("reticle", ("auto", "fixed")),
+                              ("mask_format", ("transparent", "green", "png")),
+                              ("encoder", ("libx264", "h264_nvenc"))):
+            if getattr(args, name) not in choices:
+                raise ValueError(f"{name.replace('_', '-')} 必须是 {', '.join(choices)}")
         if args.command == "overlay":
             overlay(args.video, args.mask, args.output, args.overwrite, args.duration, args.encoder, args.crf)
             return
@@ -93,6 +76,14 @@ def main():
                 raise ValueError("目录中找不到同名视频和 SRT")
             for video, srt in sorted(pairs):
                 produce(args, video, srt, args.output_dir/f"{video.stem}_hud.mp4")
+            return
+        if args.command == "analyze":
+            from .analysis import analyze
+            analyze(args.video,args.srt,args.output,duration=args.duration,window=args.window,
+                    offset=args.offset,gain=args.reticle_gain,
+                    pose_model=args.pose_model if args.pose else None,
+                    pose_interval=args.pose_interval,pose_confidence=args.pose_confidence,
+                    pose_device=args.pose_device,pose_imgsz=args.pose_imgsz,overwrite=args.overwrite)
             return
         info = probe(args.video) if args.video else {}
         width, height = args.width or info.get("width", 1920), args.height or info.get("height", 1080)
@@ -131,7 +122,7 @@ def main():
         elif args.command == "mask":
             if args.video and args.output.resolve() == args.video.resolve():
                 raise ValueError("输出路径不能覆盖输入视频")
-            mask(args.srt, args.output, width, height, args.fps or info.get("fps", "30"),
+            render_mask(args.srt, args.output, width, height, args.fps or info.get("fps", "30"),
                  args.duration or info.get("duration"), args.opacity, args.window, args.offset, args.overwrite, args.line_width,
                  args.hud_scale, args.video, args.reticle, args.reticle_gain, args.reticle_range,
                  args.pose_model if args.pose else None,args.pose_interval,args.pose_confidence,args.pose_device,
@@ -140,16 +131,16 @@ def main():
         else:
             produce(args, args.video, args.srt, args.output)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        parser.exit(1, f"错误：{error}\n")
+        raise SystemExit(f"错误：{error}") from None
     except KeyboardInterrupt:
-        parser.exit(130, "已取消\n")
+        raise SystemExit(130) from None
 
 
 def produce(args, video, srt, output):
     info = probe(video)
     hud_path = output.with_name(output.stem+"_mask.mov")
     check_output(output, [video, srt, hud_path], args.overwrite)
-    mask(srt, hud_path, args.width or info["width"], args.height or info["height"],
+    render_mask(srt, hud_path, args.width or info["width"], args.height or info["height"],
          args.fps or info["fps"], min(args.duration or info["duration"], info["duration"]),
          args.opacity, args.window, args.offset, args.overwrite, args.line_width, args.hud_scale, video, args.reticle,
          args.reticle_gain,args.reticle_range,args.pose_model if args.pose else None,
@@ -157,3 +148,77 @@ def produce(args, video, srt, output):
          args.self_destruct_last,args.self_destruct_at,not args.no_self_destruct,
          not args.no_release_prompt,args.release_follow_speed,args.pose_imgsz)
     overlay(video, hud_path, output, args.overwrite, args.duration, args.encoder, args.crf)
+
+
+_COMMAND_HELP = {
+    "mask": "生成透明 MOV、绿幕视频或 PNG 序列。",
+    "render": "生成透明 mask 并合成视频。",
+    "preview": "导出单帧透明 PNG。",
+    "batch": "批量配对同名视频和 SRT。",
+    "analyze": "导出 Fusion Fuse 使用的遥测、运动和人物缓存。",
+    "overlay": "使用已有透明 mask 合成视频。",
+}
+
+
+def _command(name, description):
+    """Expose shared defaults through real function signatures for Fire help."""
+    def command(*args, **kwargs):
+        values = command.__signature__.bind(*args, **kwargs).arguments
+        _run(name, **values)
+
+    required = {"srt", "output"}
+    if name in ("render", "analyze"):
+        required.add("video")
+    elif name == "overlay":
+        required = {"video", "mask", "output"}
+    parameters = []
+    for parameter in list(signature(_run).parameters.values())[1:]:
+        key = parameter.name
+        if key == "directory":
+            if name == "batch":
+                parameters.insert(0, parameter.replace(default=Parameter.empty))
+            continue
+        if key == "output_dir" and name != "batch":
+            continue
+        if name == "batch" and key in ("srt", "video", "output", "mask"):
+            continue
+        if name == "overlay" and key not in ("video", "mask", "output", "duration", "overwrite", "encoder", "crf"):
+            continue
+        if key == "mask" and name != "overlay":
+            continue
+        if key == "time" and name != "preview":
+            continue
+        if key == "mask_format" and name != "mask":
+            continue
+        if key in ("encoder", "crf") and name not in ("render", "batch", "overlay"):
+            continue
+        parameters.append(parameter.replace(kind=Parameter.KEYWORD_ONLY,
+                          default=Parameter.empty if key in required else parameter.default))
+    command.__signature__ = signature(_run).replace(parameters=parameters)
+    command.__name__ = name
+    command.__doc__ = description
+    return command
+
+
+def main(argv=None):
+    """DJI SRT → 游戏无人机 HUD 透明 mask → FFmpeg 合成。"""
+    commands = {name: _command(name, description) for name, description in _COMMAND_HELP.items()}
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Keep existing scripts working; Fire's -o is otherwise ambiguous with opacity.
+    arguments = ["--output" if arg == "-o" else arg for arg in arguments]
+    if arguments and arguments[0] in commands:
+        parameters = commands[arguments[0]].__signature__.parameters
+        # Fire can call a function before reporting an unconsumed flag. Reject
+        # typos first so an invalid export command cannot create or replace files.
+        for argument in arguments[1:]:
+            if argument == "--":
+                break
+            if argument.startswith("-") and len(argument) > 1 and argument.lstrip("-")[0].isalpha():
+                key = argument.lstrip("-").split("=", 1)[0].replace("-", "_")
+                if len(key) == 1:
+                    matches = [name for name in parameters if name.startswith(key)]
+                    if len(matches) == 1:
+                        key = matches[0]
+                if key != "help" and key not in parameters and not (key.startswith("no") and key[2:] in parameters):
+                    raise SystemExit(f"错误：未知参数 {argument.split('=', 1)[0]}")
+    fire.Fire(commands, command=arguments, name="bird-dji")

@@ -22,6 +22,7 @@
   <a href="#导出与合成">导出与合成</a> ·
   <a href="#参数配置">参数配置</a> ·
   <a href="#人物检测">人物检测</a> ·
+  <a href="#fusion-fuse-插件">Fusion 插件</a> ·
   <a href="#开发与验证">开发与验证</a> ·
   <a href="https://github.com/weijianxian/Landon-Harrison-with-DJI/issues">反馈问题</a>
 </p>
@@ -84,6 +85,8 @@ cd Landon-Harrison-with-DJI
 uv sync
 uv run bird-dji --help
 ```
+
+CLI 由 [Python Fire](https://github.com/google/python-fire) 构建，使用 `uv run bird-dji mask --help` 查看子命令参数和默认值。参数支持 `--line-width` 和 `--line_width` 两种写法，原有 `-o` 输出路径与布尔开关继续可用。
 
 ### 2. 放入素材
 
@@ -215,6 +218,28 @@ uv run --extra pose bird-dji batch videos --output-dir outputs --pose --encoder 
 
 自毁阶段合成时还会给实拍背景加入轻微红蓝色差和暗角，HUD 保持清楚，不添加黑屏。Mask 旁边的 `.hud.json` 保存开始时间，使用 `bird-dji overlay` 时会自动读取。透明 mask 自身包含红色 UI，背景色差/暗角须在合成阶段应用；直接使用普通 FFmpeg overlay 示例只叠 UI。移动 mask 时一并保留同名 `.hud.json`。
 
+## Fusion Fuse 插件
+
+仓库同时包含 **Bird DJI HUD** Fuse 和配套分析器。Fuse 使用原生检查器控件，开放布局、颜色、线宽、文字、圆圈、方向条、标尺、生命条、人物提示与自毁效果等参数；分析与绘制分开，改外观时无需重新运行 YOLO。
+
+```powershell
+# 安装到当前用户的达芬奇 Fuses 目录，随后重启达芬奇
+powershell -ExecutionPolicy Bypass -File fusion/install.ps1
+
+# 只分析素材，生成插件读取的 JSON 数据
+uv run --extra pose bird-dji analyze --video videos/DJI_20261002102503_0016_D.MP4 --srt videos/DJI_20261002102503_0016_D.SRT --pose -o outputs/drone.fusion.json
+```
+
+在 Fusion 页按 **Shift + Space** 搜索 **Bird DJI HUD**，接在 `MediaIn → Bird DJI HUD → MediaOut`。检查器采用一列可展开的中文分组。在 **素材分析** 设置人物分析开关、频率和精度，点击按钮即可分析当前输入素材、自动匹配同名 SRT 并载入结果。检测设备自动选择可用 CUDA，否则使用 CPU；在 **人物关键点** 设置方块更新间隔，默认每 `1` 秒取一次已有分析结果，无需重跑分析。
+
+同一个节点提供 **合并画面 / 固定 HUD / 人物追踪** 三个输出，后两个输出独立透明图层。把人物追踪先叠到原视频上，再用 Transform 缩放，最后合成固定 HUD，即可让画面和人物标记一起变换、仪表布局保持固定。
+
+开发版已在本机 Windows / Resolve 20.2.3 的图形界面验证节点加载、HUD 绘制和按钮分析自动载入：约 11 秒素材按 2 次/秒分析，生成 328 帧数据和 22 次人物扫描。插件不依赖 Studio UIManager、外部 Resolve API 或 AI 节点。发布安装包尚未制作，当前安装脚本用于开发部署。
+
+画面缓存入口位于 **数据与时间 → 预渲染 / 管理画面缓存**，使用 Fusion 原生 **Cache To Disk**。已验证 6 帧 4K 预渲染，以及清空内存后拖动读取磁盘缓存；修改外观时缓存会正常失效。分析 JSON 与画面像素分别缓存。
+
+详见 [插件安装、时间同步与参数说明](fusion/README.md)。原有透明 MOV、绿幕与 PNG 导出继续可用。
+
 ## 数据来源与行为说明
 
 <details>
@@ -240,7 +265,16 @@ uv run --extra pose bird-dji batch videos --output-dir outputs --pose --encoder 
 Python 依赖通过 uv 管理。测试覆盖 SRT 解析、方向插值、镜头运动、生命条、自毁模式、人物提示，以及透明 / 绿幕 / PNG 导出的编码结果。导出与运动测试需要 FFmpeg。
 
 ```powershell
-uv run python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -t . -v
+```
+
+测试按模块存放，可独立运行一组：
+
+```powershell
+uv run python -m unittest discover -s tests/cli -t . -v
+uv run python -m unittest discover -s tests/rendering -t . -v
+uv run python -m unittest discover -s tests/tracking -t . -v
+uv run python -m unittest discover -s tests/fusion -t . -v
 ```
 
 输出先写入临时目录，完成后才成为正式文件；不会覆盖输入视频。`videos/` 和 `outputs/` 已加入 Git 忽略。
@@ -249,21 +283,27 @@ uv run python -m unittest discover -s tests -v
 
 ```text
 src/bird_dji/
-├── cli.py          # 命令行入口
+├── cli.py          # Python Fire 命令行入口
+├── analysis.py     # Fusion 逐帧分析缓存
 ├── telemetry.py    # DJI SRT 与遥测估算
 ├── motion.py       # 镜头运动与相对方向
 ├── hud.py          # HUD 绘制与自毁状态
 ├── pose.py         # YOLOv8 关键点与人物框
 ├── release.py      # 蜂鸟目标选择与提示跟随
 └── video.py        # mask 导出与 FFmpeg 合成
-tests/              # 行为与编码验证
+tests/
+├── cli/            # Fire 命令、参数兼容与输出验证
+├── rendering/      # 遥测、镜头运动、HUD 与编码验证
+├── tracking/       # 人物关键点与蜂鸟跟随
+└── fusion/         # Fuse、分析缓存与后台任务
+fusion/             # Fuse、安装脚本与分析助手
 docs/assets/        # README 效果截图
 ```
 
 ### 后续方向
 
-- Fusion Fuse：在达芬奇内调节 HUD 参数，读取独立分析缓存，计划面向免费版兼容；当前尚未发布。
-- 分析缓存复用：调整 UI 时复用运动与人物数据，减少重复检测。
+- Fusion 后续实测：透明图层导出、整段持续播放，以及重启达芬奇后的磁盘缓存复用。
+- 自毁背景效果：把命令行版的色差与暗角移植到 Fuse 的节点渲染中。
 
 ### 反馈与贡献
 

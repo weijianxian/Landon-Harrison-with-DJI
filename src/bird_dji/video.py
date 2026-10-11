@@ -1,11 +1,13 @@
-"""Generate a reusable alpha MOV, then composite it with FFmpeg."""
+"""Export transparent masks, green-screen video or PNG sequences with FFmpeg."""
 from fractions import Fraction
 import json
 import math
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from PIL import Image
 from .hud import HUD,render_hud,self_destruct_progress
 from .telemetry import Telemetry
 
@@ -42,9 +44,23 @@ def mask(srt: Path, output: Path, width: int, height: int, fps: str,
          reticle_gain: float = 12, reticle_range: float = .18, pose_model: Path | None = None,
          pose_interval: float = 2, pose_confidence: float = .5, pose_device: str = "cpu",
          self_destruct_last: float = 3, self_destruct_at: float | None = None, self_destruct: bool = True,
-         release_prompt: bool = True, release_follow_speed: float = 180, pose_imgsz: int = 960):
-    if output.suffix.lower() != ".mov":
+         release_prompt: bool = True, release_follow_speed: float = 180, pose_imgsz: int = 960,
+         mask_format: str = "transparent"):
+    if mask_format not in ("transparent", "green", "png"):
+        raise ValueError("mask-format 必须为 transparent、green 或 png")
+    if mask_format == "transparent" and output.suffix.lower() != ".mov":
         raise ValueError("透明 mask 请使用 .mov（QuickTime Animation / qtrle + alpha）")
+    if mask_format == "green" and output.suffix.lower() not in (".mov", ".mp4"):
+        raise ValueError("绿幕 mask 请使用 .mov 或 .mp4")
+    if mask_format == "png" and output.exists():
+        # Only replace directories created by this exporter, never a footage directory.
+        if not output.is_dir() or not (output/"manifest.json").is_file():
+            raise ValueError("PNG 序列输出必须为新目录，或本工具生成的序列目录")
+        manifest = json.loads((output/"manifest.json").read_text(encoding="utf-8"))
+        if manifest.get("generator") != "bird-dji" or any(
+                not p.is_file() or (p.name != "manifest.json" and not re.fullmatch(r"frame_\d{6,}\.png",p.name))
+                for p in output.iterdir()):
+            raise ValueError("序列目录含其他文件，不能覆盖")
     check_output(output, [srt]+([video] if video else []), overwrite)
     telemetry = Telemetry.read(srt, window)
     duration = duration if duration is not None else telemetry.duration
@@ -66,12 +82,23 @@ def mask(srt: Path, output: Path, width: int, height: int, fps: str,
     release = ReleasePrompt(width,height,release_follow_speed)
     # Stage in the destination directory: interrupted renders never become final masks.
     with tempfile.TemporaryDirectory(prefix="hud-", dir=output.parent) as directory:
-        temporary = Path(directory)/"mask.mov"
+        temporary = Path(directory)/("sequence" if mask_format == "png" else "mask"+output.suffix)
+        if mask_format == "png":
+            temporary.mkdir()
         with tempfile.TemporaryFile() as errors:
             command = [binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
                        "-f", "rawvideo", "-pixel_format", "rgba", "-video_size", f"{width}x{height}",
-                       "-framerate", str(fps), "-i", "pipe:0", "-an", "-c:v", "qtrle", "-pix_fmt", "argb",
-                       "-t", str(duration), str(temporary)]
+                       "-framerate", str(fps), "-i", "pipe:0", "-an"]
+            if mask_format == "png":
+                command += ["-c:v", "png", "-pix_fmt", "rgba", "-start_number", "1"]
+                destination = temporary/"frame_%06d.png"
+            elif mask_format == "green" and output.suffix.lower() == ".mp4":
+                command += ["-c:v", "libx264", "-preset", "fast", "-crf", "12", "-pix_fmt", "yuv444p"]
+                destination = temporary
+            else:
+                command += ["-c:v", "qtrle", "-pix_fmt", "rgb24" if mask_format == "green" else "argb"]
+                destination = temporary
+            command += ["-t", str(duration), str(destination)]
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors)
             try:
                 count = math.ceil(duration*rate)
@@ -88,6 +115,8 @@ def mask(srt: Path, output: Path, width: int, height: int, fps: str,
                             aim = ((aim[0]+round(hud.ox))/width,(aim[1]+round(hud.oy))/height)
                             release.update(i/rate,pose.boxes_at(i/rate),aim)
                             release.draw(frame,hud)
+                    if mask_format == "green":
+                        frame = Image.alpha_composite(Image.new("RGBA",frame.size,(0,255,0,255)),frame)
                     process.stdin.write(frame.tobytes())
                     if i % max(1, round(rate)) == 0:
                         print(f"\r生成 mask：{i/count:.0%}", end="", flush=True)
@@ -105,17 +134,39 @@ def mask(srt: Path, output: Path, width: int, height: int, fps: str,
                 if log:
                     print(log)
                 raise
-        temporary.replace(output)
+        metadata = {"generator":"bird-dji", "mask_format":mask_format, "width":width,
+                    "height":height, "fps":str(fps), "duration":duration,
+                    "self_destruct_start":
+                    (max(0,duration-self_destruct_last) if self_destruct_at is None else self_destruct_at) if self_destruct else None}
+        if mask_format == "png":
+            metadata.update(frame_pattern="frame_%06d.png",start_number=1,
+                            frame_count=len(list(temporary.glob("frame_*.png"))))
+            (temporary/"manifest.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+            previous = Path(directory)/"previous"
+            if output.exists():
+                # Verified exporter-owned directory; keep it until the staged result is ready.
+                output.replace(previous)
+            try:
+                temporary.replace(output)
+            except OSError:
+                if previous.exists():
+                    previous.replace(output)
+                raise
+        else:
+            temporary.replace(output)
         if pose:
             pose.save(output.with_suffix(".pose.json"))
             output.with_suffix(".release.json").write_text(json.dumps({"events":release.events},ensure_ascii=False,indent=2),encoding="utf-8")
-        output.with_suffix(".hud.json").write_text(json.dumps({"self_destruct_start":
-            (max(0,duration-self_destruct_last) if self_destruct_at is None else self_destruct_at) if self_destruct else None},indent=2),encoding="utf-8")
+        output.with_suffix(".hud.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
     print(f"\r生成 mask：100% → {output}")
 
 
 def overlay(video: Path, hud: Path, output: Path, overwrite: bool = False,
             duration: float | None = None, encoder: str = "libx264", crf: int = 18):
+    effects_file = hud.with_suffix(".hud.json")
+    metadata = json.loads(effects_file.read_text(encoding="utf-8")) if effects_file.exists() else {}
+    if hud.is_dir() or metadata.get("mask_format","transparent") != "transparent":
+        raise ValueError("overlay 需要透明 MOV；绿幕请在剪辑软件中抠像，PNG 序列请按帧率导入")
     check_output(output, [video, hud], overwrite)
     info = probe(video)
     hud_info = probe(hud)
@@ -125,8 +176,7 @@ def overlay(video: Path, hud: Path, output: Path, overwrite: bool = False,
     if hud_info["duration"] + 0.1 < duration:
         raise ValueError("mask 比输出视频短，请重新生成足够长的 mask 或使用 --duration")
     w, h = info["width"], info["height"]
-    effects_file = hud.with_suffix(".hud.json")
-    start = json.loads(effects_file.read_text(encoding="utf-8")).get("self_destruct_start") if effects_file.exists() else None
+    start = metadata.get("self_destruct_start")
     effects = ""
     if start is not None:
         if not isinstance(start,(int,float)) or not math.isfinite(start) or start < 0:

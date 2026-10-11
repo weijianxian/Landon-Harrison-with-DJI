@@ -11,7 +11,7 @@ from .video import check_output, mask, overlay, probe
 def main():
     parser = argparse.ArgumentParser(description="DJI SRT → 游戏无人机 HUD 透明 mask → FFmpeg 合成")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, description in [("mask", "只生成透明 MOV"), ("render", "生成 mask 并合成视频"),
+    for name, description in [("mask", "生成透明 MOV、绿幕视频或 PNG 序列"), ("render", "生成 mask 并合成视频"),
                               ("preview", "导出单帧透明 PNG"), ("batch", "批量配对同名视频和 SRT")]:
         p = sub.add_parser(name, help=description)
         if name == "batch":
@@ -47,6 +47,9 @@ def main():
         p.add_argument("--overwrite", action="store_true")
         if name == "preview":
             p.add_argument("--time", type=float, default=0)
+        if name == "mask":
+            p.add_argument("--mask-format", choices=["transparent","green","png"], default="transparent",
+                           help="默认透明 MOV；green 为绿幕 MOV/MP4；png 为透明 PNG 序列，output 指定目录")
         if name in ("render", "batch"):
             p.add_argument("--encoder", choices=["libx264", "h264_nvenc"], default="libx264")
             p.add_argument("--crf", type=int, default=18)
@@ -133,7 +136,7 @@ def main():
                  args.hud_scale, args.video, args.reticle, args.reticle_gain, args.reticle_range,
                  args.pose_model if args.pose else None,args.pose_interval,args.pose_confidence,args.pose_device,
                  args.self_destruct_last,args.self_destruct_at,not args.no_self_destruct,
-                 not args.no_release_prompt,args.release_follow_speed,args.pose_imgsz)
+                 not args.no_release_prompt,args.release_follow_speed,args.pose_imgsz,args.mask_format)
         else:
             produce(args, args.video, args.srt, args.output)
     except (ValueError, OSError, subprocess.SubprocessError) as error:

@@ -25,6 +25,18 @@ uv run bird-dji mask --video videos/DJI_20261002102503_0016_D.MP4 --srt videos/D
 uv run bird-dji mask --srt videos/DJI_20261002102503_0016_D.SRT --width 3840 --height 2160 --fps 30000/1001 -o outputs/drone_mask.mov
 ```
 
+默认 `--mask-format transparent` 导出带 alpha 的透明 MOV。另支持绿幕视频和透明 PNG 序列：
+
+```powershell
+# 纯绿底 MOV（无损），也可将输出扩展名改为 .mp4
+uv run bird-dji mask --video videos/DJI_20261002102503_0016_D.MP4 --srt videos/DJI_20261002102503_0016_D.SRT --mask-format green -o outputs/drone_green.mov
+
+# output 为目录；每张 PNG 都保留透明度
+uv run bird-dji mask --video videos/DJI_20261002102503_0016_D.MP4 --srt videos/DJI_20261002102503_0016_D.SRT --mask-format png -o outputs/drone_frames
+```
+
+PNG 序列从 `frame_000001.png` 开始，目录中的 `manifest.json` 记录帧率、时长和帧数；导入剪辑软件时设置对应帧率。加 `--overwrite` 可以替换本工具生成的序列目录，含其他文件的目录不会被覆盖。绿幕使用纯绿色背景（RGB 0,255,0），需在剪辑软件中抠像；半透明线条建议优先使用透明 MOV 或 PNG。`render` 和 `batch` 仍生成透明 MOV 并自动合成，`overlay` 接受透明 MOV。
+
 ### 合成已有 mask
 
 ```powershell

@@ -36,7 +36,7 @@ def main():
         p.add_argument("--reticle-range", type=float, default=.18, help="圆圈最大偏移占 HUD 宽/高的比例，默认 0.18")
         p.add_argument("--pose", action="store_true", help="YOLOv8 人体关键点橙黄色方块")
         p.add_argument("--pose-model", type=Path, default=Path("models/yolov8n-pose.pt"))
-        p.add_argument("--pose-interval", type=float, default=.1, help="检测间隔秒，默认 0.1 秒（10 fps）")
+        p.add_argument("--pose-interval", type=float, default=2, help="检测间隔秒，默认 2 秒（0.5 次/秒）")
         p.add_argument("--pose-imgsz", type=int, default=960, help="检测输入尺寸，默认 960")
         p.add_argument("--pose-confidence", type=float, default=.5, help="关键点置信度阈值")
         p.add_argument("--pose-device", default="cpu", help="cpu 或 CUDA 设备编号，如 0")

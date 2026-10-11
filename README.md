@@ -61,9 +61,9 @@ uv sync --extra pose
 uv run --extra pose bird-dji batch videos --output-dir outputs --pose --encoder h264_nvenc --overwrite
 ```
 
-`--pose` 同样适用于 `mask`、`render` 和 `preview`。人体关键点直接绘入透明 mask，偏红的橙色小方框内带中心菱形，不画骨架、不画人体包围框。默认按视频时间每秒检测 10 次（0、0.1、0.2…秒），以该时刻附近的视频帧为输入；两次扫描之间保持上次坐标，下一次扫描覆盖，检测消失就清除。保存旁边的 `.pose.json` 可查看扫描时间、人数、归一化关键点坐标与置信度。离线推理和导出速度取决于硬件。
+`--pose` 同样适用于 `mask`、`render` 和 `preview`。人体关键点直接绘入透明 mask，偏红的橙色小方框内带中心菱形，不画骨架、不画人体包围框。默认按视频时间每秒检测 0.5 次（每 2 秒一次：0、2、4…秒），以该时刻附近的视频帧为输入；两次扫描之间保持上次坐标，下一次扫描覆盖，检测消失就清除。保存旁边的 `.pose.json` 可查看扫描时间、人数、归一化关键点坐标与置信度。离线推理和导出速度取决于硬件。
 
-默认 `--pose-confidence 0.5` 过滤低可信和遮挡的关键点；`--pose-interval 0.1` 为扫描间隔，可改为 `1` 恢复每秒一次；`--pose-device cpu` 可改成 `0` 使用 CUDA（需安装支持 CUDA 的 PyTorch）。模型在本地运行，视频不会上传。关键点推理输入尺寸默认 `--pose-imgsz 960`，可调为 `1280` 提高细节识别。坐标按完整视频画面映射，不随中央 HUD 缩小。
+默认 `--pose-confidence 0.5` 过滤低可信和遮挡的关键点；`--pose-interval 2` 为扫描间隔，可改为 `1` 使用每秒一次；`--pose-device cpu` 可改成 `0` 使用 CUDA（需安装支持 CUDA 的 PyTorch）。模型在本地运行，视频不会上传。关键点推理输入尺寸默认 `--pose-imgsz 960`，可调为 `1280` 提高细节识别。坐标按完整视频画面映射，不随中央 HUD 缩小。
 
 官方模型与关键点 API：[YOLOv8 模型](https://docs.ultralytics.com/models/yolov8/)、[Keypoints](https://docs.ultralytics.com/reference/engine/results/#ultralytics.engine.results.Keypoints)。
 
@@ -71,7 +71,7 @@ uv run --extra pose bird-dji batch videos --output-dir outputs --pose --encoder 
 
 默认在导出视频最后 3 秒进入自毁模式：约 0.12 秒内快速切换为红色 HUD，括号和刻度变细变淡，速度填充线、水平短线和生命值填充条保持鲜明的红色，瞄准圆圈及连接线进一步淡化。红色警告牌内有黑色警告三角与“自毁模式”。保留实拍画面，不做末尾黑屏或断信号效果。`--self-destruct-last 5` 改为最后 5 秒；`--self-destruct-at 6` 指定从第 6 秒开始（优先于末尾秒数）；`--no-self-destruct` 关闭。短于 3 秒的片段从开头进入过渡。红橙色人体关键点保持原样。
 
-开启 `--pose` 后，选择画面中 bbox 中心距离移动瞄准圆圈最近的人，显示 `X 释放蜂鸟`（按屏幕像素距离选择）。提示第一次出现时，其整体中心放在 bbox 中心；随后按 0.2 秒平滑响应跟随，并限制最大速度为 1080p 下 180 像素/秒（随分辨率缩放），不瞬间跳到新位置。人物框默认每秒刷新 10 次，按相邻扫描 bbox 的重叠率关联；未检测到人物时隐藏，切换人物时重新居中。这里只绘制视频 UI，不绑定按键或实际无人机动作。
+开启 `--pose` 后，选择画面中 bbox 中心距离移动瞄准圆圈最近的人，显示 `X 释放蜂鸟`（按屏幕像素距离选择）。提示第一次出现时，其整体中心放在 bbox 中心；随后按 0.2 秒平滑响应跟随，并限制最大速度为 1080p 下 180 像素/秒（随分辨率缩放），不瞬间跳到新位置。人物框默认每 2 秒刷新一次，按相邻扫描 bbox 的重叠率关联；未检测到人物时隐藏，切换人物时重新居中。这里只绘制视频 UI，不绑定按键或实际无人机动作。
 
 用 `--release-follow-speed 100` 降低移动速度，`--no-release-prompt` 关闭提示。`.pose.json` 保存归一化 bbox 和临时跟踪编号，`.release.json` 保存触发时刻与初始位置，方便检查。bbox 只用于判定，不画出来。
 

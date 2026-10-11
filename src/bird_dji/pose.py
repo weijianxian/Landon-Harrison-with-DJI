@@ -60,7 +60,7 @@ class PoseTimeline:
 
     @classmethod
     def read(cls, video: Path, duration: float, model_path: Path,
-             interval: float = .1, confidence: float = .5, device: str = "cpu", imgsz: int = 960):
+             interval: float = 2, confidence: float = .5, device: str = "cpu", imgsz: int = 960):
         model = load_model(str(model_path.resolve()))
         capture = cv2.VideoCapture(str(video))
         if not capture.isOpened():

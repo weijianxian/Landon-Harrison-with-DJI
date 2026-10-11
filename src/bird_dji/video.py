@@ -40,7 +40,7 @@ def mask(srt: Path, output: Path, width: int, height: int, fps: str,
          offset: float = 0, overwrite: bool = False, line_width: float = 4,
          hud_scale: float = .65, video: Path | None = None, reticle: str = "auto",
          reticle_gain: float = 12, reticle_range: float = .18, pose_model: Path | None = None,
-         pose_interval: float = .1, pose_confidence: float = .5, pose_device: str = "cpu",
+         pose_interval: float = 2, pose_confidence: float = .5, pose_device: str = "cpu",
          self_destruct_last: float = 3, self_destruct_at: float | None = None, self_destruct: bool = True,
          release_prompt: bool = True, release_follow_speed: float = 180, pose_imgsz: int = 960):
     if output.suffix.lower() != ".mov":
